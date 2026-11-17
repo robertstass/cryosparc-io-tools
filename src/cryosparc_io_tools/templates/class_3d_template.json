@@ -1,0 +1,101 @@
+{
+  "_id": "6afc42cc4ff1f2ea4d4877ac",
+  "category": "Workflow Repeat",
+  "createdAt": "2026-11-17T12:04:44.887Z",
+  "createdBy": "workflow_repeat",
+  "csVersion": "v5.0.7",
+  "description": "Select the input particles (eg from a 3D refinement or symmetry expansion job) in addition to the solvent mask and focus mask input volume jobs (each containing multiple masks from a wildcard expansion), then apply this workflow to connect the parent connections correctly.",
+  "jobs": {
+    "J1": {
+      "title": "",
+      "description": "",
+      "jobType": "class_3D",
+      "groups": [
+        [
+          "P1.particles",
+          "particles"
+        ],
+        [
+          "P2.imported_mask_1",
+          "mask"
+        ],
+        [
+          "P3.imported_mask_1",
+          "mask_focus"
+        ]
+      ],
+      "individualResults": [],
+      "parameters": {
+        "class3D_N_K": {
+          "value": 3,
+          "locked": false,
+          "visible": true,
+          "flagged": false,
+          "notes": ""
+        },
+        "class3D_target_res": {
+          "value": 15,
+          "locked": false,
+          "visible": true,
+          "flagged": false,
+          "notes": ""
+        },
+        "class3D_class_anneal_beta": {
+          "value": 0.1,
+          "locked": false,
+          "visible": true,
+          "flagged": false,
+          "notes": ""
+        }
+      }
+    }
+  },
+  "parents": {
+    "P1": {
+      "jobType": "",
+      "groups": {
+        "particle": {
+          "name": "particles",
+          "connections": [
+            "particles"
+          ],
+          "required": [
+            "blob",
+            "ctf",
+            "alignments3D"
+          ]
+        }
+      }
+    },
+    "P2": {
+      "jobType": "import_volumes",
+      "groups": {
+        "mask": {
+          "name": "mask",
+          "connections": [
+            "imported_mask_1"
+          ],
+          "required": [
+            "mask"
+          ]
+        }
+      }
+    },
+    "P3": {
+      "jobType": "import_volumes",
+      "groups": {
+        "mask": {
+          "name": "mask_focus",
+          "connections": [
+            "imported_mask_1"
+          ],
+          "required": [
+            "mask"
+          ]
+        }
+      }
+    }
+  },
+  "title": "class_3D repeated 1 times.",
+  "workflowVersion": "1.0.0"
+}

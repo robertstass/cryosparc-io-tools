@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cryosparc-io-tools"
+version = "0.1.0"
+description = "Small, dependency-free utilities for CryoSPARC workflow JSON files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "CryoSPARC IO Tools contributors"}]
+dependencies = []
+
+[project.scripts]
+cryosparc-workflow-repeat = "cryosparc_io_tools.cryosparc_workflow_repeat:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cryosparc_io_tools = ["templates/*.json"]
