@@ -51,53 +51,145 @@ def _as_numbered_connection(source: str, parents: dict[str, Any]) -> tuple[str, 
     return parent_id, match.group("stem"), int(match.group("index"))
 
 
-def _job_indices(job: dict[str, Any], parents: dict[str, Any]) -> set[int]:
+def _job_indices(job: dict[str, Any], parents: dict[str, Any],
+                 selected_parents: set[str] | None = None,
+                 positions: set[int] | None = None) -> set[int]:
+    """Numbered indices used by a job, optionally only at the given input slots."""
     indices = set()
-    for pair in job.get("groups", []):
+    for position, pair in enumerate(job.get("groups", [])):
+        if positions is not None and position not in positions:
+            continue
         if isinstance(pair, list) and len(pair) >= 1:
             match = _as_numbered_connection(pair[0], parents)
-            if match is not None:
+            if match is not None and (selected_parents is None or match[0] in selected_parents):
                 indices.add(match[2])
     return indices
 
 
-def _series_order(jobs: dict[str, Any], parents: dict[str, Any]) -> list[str] | None:
-    """Return ascending job IDs only for a uniform, numbered one-job-per-index series.
+def _group_steps(slots: dict[str, dict[int, int]]
+                 ) -> tuple[set[int], set[int], dict[int, int], dict[str, int]] | None:
+    """Analyse identical jobs given their numbered inputs as {job: {slot: index}}.
 
-    Require exactly the same job structure, settings and parent families after
-    stripping numeric suffixes. Multiple distinct indices within a job, shared
-    indices between jobs, and internal job references prevent extension.
+    Each numbered slot counts up from its **own** start index: 0 if the slot
+    uses index 0 in any job, otherwise 1. So ``particles_class_0/1`` can
+    advance together with ``imported_mask_1/2`` (classes 0.., masks 1..).
+
+    Slots whose index differs between jobs (*varying*) fix the job order by
+    their rank, so all of them must give each job the same rank (offsets
+    between slots are fine, e.g. class_0 with mask_1). Slots that are the same
+    in every job are *constant*. Returns (all slots, varying slots, start
+    index per slot, step per job), or None if the jobs do not form such a
+    series.
+    """
+    names = list(slots)
+    positions = set().union(*(slots[name] for name in names)) if names else set()
+    if any(position not in slots[name] for name in names for position in positions):
+        return None
+    varying = {position for position in positions
+               if len({slots[name][position] for name in names}) > 1}
+    if not varying:
+        return None
+    steps: dict[str, list[int]] = {name: [] for name in names}
+    starts: dict[int, int] = {}
+    for position in sorted(positions):
+        values = [slots[name][position] for name in names]
+        starts[position] = 0 if 0 in values else 1
+        if position not in varying:
+            continue
+        if len(set(values)) != len(values):
+            return None
+        ordered = sorted(values)
+        for name in names:
+            steps[name].append(ordered.index(slots[name][position]))
+    if any(len(set(ranks)) != 1 for ranks in steps.values()):
+        return None
+    return positions, varying, starts, {name: ranks[0] for name, ranks in steps.items()}
+
+
+def _structure(job: dict[str, Any], parents: dict[str, Any],
+               selected_parents: set[str] | None) -> tuple[str, dict[int, int]]:
+    """Job signature with numbered indices masked out, plus its {slot: index}."""
+    job = copy.deepcopy(job)
+    found: dict[int, int] = {}
+    for position, pair in enumerate(job.get("groups", [])):
+        if not isinstance(pair, list) or not pair or not isinstance(pair[0], str):
+            continue
+        numbered = _as_numbered_connection(pair[0], parents)
+        if numbered:
+            if selected_parents is None or numbered[0] in selected_parents:
+                found[position] = numbered[2]
+            pair[0] = f"{numbered[0]}.{numbered[1]}#"
+    return json.dumps(job, sort_keys=True), found
+
+
+def _series_order(jobs: dict[str, Any], parents: dict[str, Any],
+                  selected_parents: set[str] | None = None
+                  ) -> tuple[list[str], set[int], dict[int, int]] | None:
+    """Find a uniform series among the selected jobs.
+
+    The jobs must be identical apart from numbered inputs, must not depend on
+    each other, and must form a series as described in :func:`_group_steps`.
+    Returns ascending source job IDs, the slots that advance and each slot's
+    start index. Slots that are constant across the selected jobs are pinned. Slots that are constant across the selected jobs are pinned.
     """
     if len(jobs) < 2:
         return None
-    canonical = None
-    ordered = []
-    for job_id, original in jobs.items():
-        indices = _job_indices(original, parents)
-        if len(indices) != 1:
+    signatures = set()
+    slots: dict[str, dict[int, int]] = {}
+    for name, job in jobs.items():
+        if any(isinstance(pair, list) and pair and isinstance(pair[0], str)
+               and not _as_numbered_connection(pair[0], parents)
+               and pair[0].split(".", 1)[0] in jobs for pair in job.get("groups", [])):
             return None
-        index = next(iter(indices))
-        job = copy.deepcopy(original)
-        saw_numbered = False
-        for pair in job.get("groups", []):
-            if not isinstance(pair, list) or not pair or not isinstance(pair[0], str):
-                continue
-            source = pair[0]
-            numbered = _as_numbered_connection(source, parents)
-            if numbered:
-                if numbered[2] != index:
-                    return None
-                pair[0] = f"{numbered[0]}.{numbered[1]}#"
-                saw_numbered = True
-            elif source.split(".", 1)[0] in jobs:
-                return None
-        if not saw_numbered or (canonical is not None and job != canonical):
-            return None
-        canonical = job
-        ordered.append((index, int(JOB_NAME.fullmatch(job_id).group(1)), job_id))
-    if len({x[0] for x in ordered}) != len(ordered):
+        signature, slots[name] = _structure(job, parents, selected_parents)
+        signatures.add(signature)
+    if len(signatures) != 1:
         return None
-    return [entry[2] for entry in sorted(ordered)]
+    analysed = _group_steps(slots)
+    if analysed is None:
+        return None
+    _, varying, starts, steps = analysed
+    return sorted(jobs, key=lambda n: (steps[n], int(JOB_NAME.fullmatch(n).group(1)))), varying, starts
+
+
+def _varying_slots(jobs: dict[str, Any], parents: dict[str, Any],
+                   selected_parents: set[str] | None = None,
+                   selected: set[str] | None = None
+                   ) -> dict[str, tuple[set[int], dict[int, int], int, str]]:
+    """Per selected job: (advancing slots, start per slot, step, group id).
+
+    Jobs are grouped across the *whole* workflow by their definition with
+    numbered indices masked out. A group of two or more that forms a series
+    (see :func:`_group_steps`) fixes each member's step and per-slot start, so
+    ``--jobs J2`` numbers its series like the full run does.
+
+    Which slots advance depends on the *selected* members of the group: with
+    two or more selected, a slot that is constant across them is pinned; with
+    just one selected there is no such evidence and every numbered slot
+    advances. Jobs with no identical sibling, or whose group is not a
+    consistent series, have no entry.
+    """
+    groups: dict[str, list[str]] = {}
+    slots: dict[str, dict[int, int]] = {}
+    for name, original in jobs.items():
+        signature, slots[name] = _structure(original, parents, selected_parents)
+        groups.setdefault(signature, []).append(name)
+    result: dict[str, tuple[set[int], dict[int, int], int, str]] = {}
+    for group_id, members in enumerate(groups.values()):
+        chosen = [name for name in members if selected is None or name in selected]
+        if len(members) < 2 or not chosen:
+            continue
+        analysed = _group_steps({name: slots[name] for name in members})
+        if analysed is None:
+            continue
+        positions, _, starts, steps = analysed
+        advancing = positions
+        if len(chosen) >= 2:
+            advancing = {position for position in positions
+                         if len({slots[name][position] for name in chosen}) > 1} or positions
+        for name in chosen:
+            result[name] = (advancing, starts, steps[name], f"g{group_id}")
+    return result
 
 
 def _reconcile_parents(jobs: dict[str, Any], parents: dict[str, Any]) -> None:
@@ -134,13 +226,16 @@ def _reconcile_parents(jobs: dict[str, Any], parents: dict[str, Any]) -> None:
 def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
                     jobs: list[str] | None = None,
                     no_series_extension: bool = False,
-                    exclude_remainder_jobs: bool = False) -> dict[str, Any]:
+                    exclude_remainder_jobs: bool = True,
+                    selected_parents: list[str] | None = None) -> dict[str, Any]:
     """Extend uniform series to N jobs, otherwise repeat selected jobs N times.
 
     The default series extension requires >=2 identical jobs varying only by
     their numbered parent outputs; N then means the final series size.
-    Otherwise N means copies of each selected job. Unselected jobs are retained
-    once unless exclude_remainder_jobs is set.
+    Otherwise N means copies of each selected job. Unselected jobs are excluded
+    by default. If selected_parents is supplied, only indexed connections from
+    those parents advance; all other parent inputs remain as in the source job
+    (or the first series job when extending a series).
     """
     if repeats < 1:
         raise ValueError("--repeats must be a positive integer")
@@ -151,6 +246,13 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
         raise ValueError("Input JSON must have a non-empty 'jobs' object")
     if not isinstance(parents, dict):
         raise ValueError("Input JSON 'parents' must be an object")
+    parent_filter = set(selected_parents) if selected_parents is not None else None
+    if parent_filter is not None:
+        if not parent_filter:
+            raise ValueError("--parents must specify at least one parent")
+        unknown_parents = sorted(parent_filter - set(parents))
+        if unknown_parents:
+            raise ValueError("Unknown parent ID(s): " + ", ".join(unknown_parents))
     original_names = list(original_jobs)
     if any(JOB_NAME.fullmatch(name) is None for name in original_names):
         raise ValueError("Job IDs must be in the form J1, J2, ...")
@@ -161,14 +263,58 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
     if unknown:
         raise ValueError("Unknown job ID(s): " + ", ".join(unknown))
     selected = {name: original_jobs[name] for name in selected_names}
-    series = None if no_series_extension else _series_order(selected, parents)
-    indices = sorted({index for job in selected.values() for index in _job_indices(job, parents)})
+    detected_series = _series_order(selected, parents, parent_filter)
+    series = None if no_series_extension else detected_series
+    # Per job: (slots that advance, start index per slot, step, group). A
+    # recognised series supplies these directly; otherwise identical sibling
+    # jobs anywhere in the workflow (even unselected ones) are used, so
+    # constant numbered inputs such as one shared mask stay fixed. No evidence
+    # means every numbered input of the selected parents advances.
+    if detected_series is not None:
+        series_names, varying_positions, slot_starts = detected_series
+        info = {name: (varying_positions, slot_starts, step, "series")
+                for step, name in enumerate(series_names)}
+    else:
+        info = _varying_slots(original_jobs, parents, parent_filter, set(selected_names))
+        if len(selected_names) == 1 and selected_names[0] not in info:
+            # One job and no identical sibling: each numbered input advances
+            # from its own start index.
+            solo = _structure(selected[selected_names[0]], parents, parent_filter)[1]
+            if solo:
+                info[selected_names[0]] = (set(solo), {position: 0 if value == 0 else 1
+                                                       for position, value in solo.items()}, 0, "solo")
+
+    def active_for(name: str) -> set[int] | None:
+        return info[name][0] if name in info else None
+
+    # "Step mode": every selected job has a known step in a known series.
+    step_mode = all(name in info and info[name][2] is not None for name in selected_names)
+    if step_mode:
+        steps_in_group: dict[str, list[int]] = {}
+        for name in selected_names:
+            steps_in_group.setdefault(info[name][3], []).append(info[name][2])
+        step_rank = {gid: {step: rank for rank, step in enumerate(sorted(set(values)))}
+                     for gid, values in steps_in_group.items()}
+        group_width = {gid: len(ranks) for gid, ranks in step_rank.items()}
+        indices: list[int] = []
+    else:
+        indices = sorted({index for name, job in selected.items()
+                          for index in _job_indices(job, parents, parent_filter, active_for(name))})
+        if parent_filter is not None and not indices:
+            raise ValueError("No numbered parent outputs from --parents are used by the selected jobs")
     index_position = {value: position for position, value in enumerate(indices)}
     width = len(indices)
+    # Value mode: zero-based if index 0 is used (or the siblings use it).
+    start_index = 0 if 0 in indices else 1
 
     def rank(name: str) -> tuple[float, int]:
-        values = sorted(_job_indices(original_jobs[name], parents))
-        return (values[0] if values else float("inf"), int(JOB_NAME.fullmatch(name).group(1)))
+        # Sort by the parents actually being advanced, not by unrelated
+        # numbered connections or by the source JSON/job-ID order.
+        number = int(JOB_NAME.fullmatch(name).group(1))
+        if step_mode:
+            return (step_rank[info[name][3]][info[name][2]], number)
+        values = sorted(_job_indices(original_jobs[name], parents, parent_filter, active_for(name)))
+        return (values[0] if values else float("inf"), number)
 
     sorted_names = sorted(selected_names, key=rank)
     generated: dict[str, Any] = {}
@@ -178,16 +324,23 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
     count = repeats if series is not None else repeats * len(sorted_names)
     remainder_map = {name: f"J{count + i + 1}" for i, name in enumerate(remainder_names)}
 
-    def rewrite(job: dict[str, Any], index_map: dict[int, int], id_map: dict[str, str]) -> dict[str, Any]:
+    def rewrite(job: dict[str, Any], index_map: dict[int, int], id_map: dict[str, str],
+                active_positions: set[int] | None = None,
+                slot_targets: dict[int, int] | None = None) -> dict[str, Any]:
+        """Rewrite connections; slot_targets ({slot: new index}) wins over index_map."""
         rewritten = copy.deepcopy(job)
-        for pair in rewritten.get("groups", []):
+        for position, pair in enumerate(rewritten.get("groups", [])):
             if not isinstance(pair, list) or not pair or not isinstance(pair[0], str):
                 continue
             source = pair[0]
             matched = _as_numbered_connection(source, parents)
-            if matched is not None and matched[2] in index_map:
+            if (matched is not None and (parent_filter is None or matched[0] in parent_filter)
+                    and (active_positions is None or position in active_positions)
+                    and (position in slot_targets if slot_targets is not None
+                         else matched[2] in index_map)):
                 parent, stem, original_index = matched
-                pair[0] = f"{parent}.{stem}{index_map[original_index]}"
+                new_index = slot_targets[position] if slot_targets is not None else index_map[original_index]
+                pair[0] = f"{parent}.{stem}{new_index}"
             elif "." in source:
                 provider, output = source.split(".", 1)
                 if provider in id_map:
@@ -196,14 +349,17 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
 
     if series is not None:
         # All templates are identical except numbered parent inputs. Use the
-        # first job as the prototype and extend the series to N total jobs.
-        base_name = series[0]
-        base_index = next(iter(_job_indices(selected[base_name], parents)))
+        # lowest-step job as the prototype and extend to N total jobs; each
+        # advancing slot counts up from its own start index.
+        base_name = series_names[0]
         for i in range(repeats):
-            generated[f"J{i + 1}"] = rewrite(selected[base_name], {base_index: i + 1}, remainder_map)
+            generated[f"J{i + 1}"] = rewrite(
+                selected[base_name], {}, remainder_map, active_positions=varying_positions,
+                slot_targets={position: slot_starts[position] + i for position in varying_positions}
+            )
         # Remainder references to original series jobs map to corresponding
         # indices when present, or to the final generated job if N is smaller.
-        for i, name in enumerate(series):
+        for i, name in enumerate(series_names):
             first_id_map[name] = f"J{min(i + 1, repeats)}"
     else:
         for repeat in range(repeats):
@@ -212,10 +368,18 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
             if repeat == 0:
                 first_id_map.update(id_map)
             combined_map = {**remainder_map, **id_map}
-            indices_for_copy = {old: repeat * width + position + 1
+            indices_for_copy = {old: repeat * width + position + start_index
                                 for old, position in index_position.items()}
             for old in sorted_names:
-                generated[id_map[old]] = rewrite(selected[old], indices_for_copy, combined_map)
+                targets = None
+                if step_mode:
+                    slots_, starts_, step_, gid = info[old]
+                    new_step = repeat * group_width[gid] + step_rank[gid][step_]
+                    targets = {position: starts_[position] + new_step for position in slots_}
+                generated[id_map[old]] = rewrite(
+                    selected[old], indices_for_copy, combined_map,
+                    active_positions=active_for(old), slot_targets=targets
+                )
 
     if remainder_names:
         all_maps = {**first_id_map, **remainder_map}
@@ -290,8 +454,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-n", "--repeats", type=int, help="Final job count for a detected series, otherwise copies of selected jobs")
     parser.add_argument("--jobs", nargs="+", action="append", metavar="JID",
                         help="Select jobs to repeat, e.g. --jobs J1 J2 or --jobs J1,J2 (default: all)")
-    parser.add_argument("--exclude-remainder-jobs", action="store_true",
-                        help="Discard jobs not selected with --jobs (default: retain each once)")
+    remainder_options = parser.add_mutually_exclusive_group()
+    remainder_options.add_argument("--include-remainder-jobs", dest="remainder_choice",
+                                   action="store_const", const=False, default=None,
+                                   help="Keep jobs not selected with --jobs once (default: exclude)")
+    remainder_options.add_argument("--exclude-remainder-jobs", dest="remainder_choice",
+                                   action="store_const", const=True, help="Discard unselected jobs (default)")
+    parser.add_argument("--parents", nargs="+", action="append", metavar="PID",
+                        help="Only advance numbered outputs of these parents, e.g. P1 P2; "
+                             "other parents' inputs stay fixed (default: all parents)")
     parser.add_argument("--no-series-extension", action="store_true",
                         help="Disable series detection: always make N copies of each selected job")
     parser.add_argument("-o", "--output", type=Path, help="Output JSON path (default: workflow.json or INPUT_STEM_repeated_N[_PARAM_VALUE].json)")
@@ -310,13 +481,17 @@ def main(argv: list[str] | None = None) -> int:
             selected_jobs = ([item.strip() for group in args.jobs for token in group
                               for item in token.split(",") if item.strip()]
                              if args.jobs else None)
+            parent_ids = ([item.strip() for group in args.parents for token in group
+                           for item in token.split(",") if item.strip()]
+                          if args.parents else None)
             workflow = repeat_workflow(workflow, args.repeats, jobs=selected_jobs,
                                        no_series_extension=args.no_series_extension,
-                                       exclude_remainder_jobs=args.exclude_remainder_jobs)
-        if args.repeats is None and (args.jobs or args.exclude_remainder_jobs or args.no_series_extension):
-            raise ValueError("--jobs, --exclude-remainder-jobs and --no-series-extension require --repeats")
-        if args.exclude_remainder_jobs and not args.jobs:
-            raise ValueError("--exclude-remainder-jobs requires --jobs")
+                                       exclude_remainder_jobs=(True if args.remainder_choice is None
+                                                               else args.remainder_choice),
+                                       selected_parents=parent_ids)
+        if args.repeats is None and (args.jobs or args.parents or args.no_series_extension
+                                    or args.remainder_choice is not None):
+            raise ValueError("--jobs, --parents, remainder options and --no-series-extension require --repeats")
         set_parameters(workflow, args.overrides)
         if args.repeats is not None:
             update_metadata(workflow, args.repeats, args.overrides,
