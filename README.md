@@ -1,8 +1,9 @@
 # cryosparc-io-tools
 
-Small **standard-library-only** tools for editing CryoSPARC files. The
-first tool, `cryosparc_workflow_repeat.py`, repeats workflow jobs and updates
-indexed parent input connections.
+Tools for editing CryoSPARC files. 
+
+The first tool (an only so far), `cryosparc_workflow_repeat.py`, repeats workflow jobs and updates
+indexed parent input connections. Think of it like a for loop for CryoSPARC. 
 
 ## Quick start
 
