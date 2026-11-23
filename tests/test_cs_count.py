@@ -103,7 +103,7 @@ class CliTests(unittest.TestCase):
             result = run(["good.cs", "bad.cs", "missing.cs", "none_*.cs", "--output-csv", "o.csv"],
                          directory, check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertEqual(result.stdout, "6\tgood.cs\n")
+            self.assertEqual(result.stdout, "6\tgood.cs\nWritten csv file to: o.csv\n")
             self.assertIn("bad.cs", result.stderr)
             self.assertIn("no file matches 'missing.cs'", result.stderr)
             self.assertIn("no file matches 'none_*.cs'", result.stderr)

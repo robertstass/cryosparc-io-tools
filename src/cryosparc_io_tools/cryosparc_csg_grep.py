@@ -211,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.long:
             write_csv(args.output_csv, ["file", "key", "value"],
                       ([path, key, value] for path, hits in results for key, value in hits))
+            print(f"Written csv file to: {args.output_csv}")
         else:
             columns: list[str] = []
             for _, hits in results:
@@ -219,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                         columns.append(key)
             write_csv(args.output_csv, ["file", *columns],
                       ([path, *(dict(hits).get(key, "") for key in columns)] for path, hits in results))
+            print(f"Written csv file to: {args.output_csv}")
     return 1 if failed else 0
 
 

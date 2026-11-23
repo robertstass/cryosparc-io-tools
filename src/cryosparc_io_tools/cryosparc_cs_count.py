@@ -58,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{count}\t{path}")
     if args.output_csv:
         write_csv(args.output_csv, ["file", "particles"], rows)
+        print(f"Written csv file to: {args.output_csv}")
     return 1 if failed else 0
 
 
