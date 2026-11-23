@@ -2,6 +2,8 @@
 
 Small command-line tools for CryoSPARC files.
 
+Vibe coded by Robert Stass, STRUBI, University of Oxford. 
+
 | Tool | Does |
 | --- | --- |
 | `cryosparc_workflow_repeat.py` | Repeat workflow jobs and sweep parameters, like a for loop for CryoSPARC. |
