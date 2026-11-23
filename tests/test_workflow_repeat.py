@@ -8,7 +8,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from cryosparc_io_tools.cryosparc_workflow_repeat import repeat_workflow, set_parameters, template
+from cryosparc_io_tools.cryosparc_workflow_repeat import (Delimiters, apply_sets, expand_range, parse_set,
+                                                           repeat_workflow, template)
 
 
 class RepeatTests(unittest.TestCase):
@@ -34,8 +35,9 @@ class RepeatTests(unittest.TestCase):
         self.assertEqual(original["jobs"]["J1"]["groups"][1][0], "P2.imported_mask_1")
 
     def test_override(self):
-        workflow = repeat_workflow(template(), 3)
-        set_parameters(workflow, ["class3D_N_K=5", "J2:class3D_target_res=10.5"])
+        workflow, combinations = apply_sets(repeat_workflow(template(), 3),
+                                            ["class3D_N_K=5", "J2:class3D_target_res=10.5"])
+        self.assertIsNone(combinations)
         self.assertEqual([j["parameters"]["class3D_N_K"]["value"] for j in workflow["jobs"].values()], [5, 5, 5])
         self.assertEqual(workflow["jobs"]["J2"]["parameters"]["class3D_target_res"]["value"], 10.5)
         self.assertEqual(workflow["jobs"]["J1"]["parameters"]["class3D_target_res"]["value"], 15)
@@ -581,7 +583,378 @@ class RepeatTests(unittest.TestCase):
 
     def test_reject_unknown_parameter(self):
         with self.assertRaisesRegex(ValueError, "not found"):
-            set_parameters(template(), ["not_a_parameter=5"])
+            apply_sets(template(), ["not_a_parameter=5"])
+
+
+CLI = [sys.executable, "-B", str(ROOT / "cryosparc_workflow_repeat.py")]
+
+
+def _run(args, cwd, check=True):
+    return subprocess.run(CLI + args, cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def _values(workflow, param="class3D_N_K"):
+    return [job["parameters"][param]["value"] for job in workflow["jobs"].values()]
+
+
+class RangeParsingTests(unittest.TestCase):
+    def test_range_stop_is_inclusive(self):
+        self.assertEqual(expand_range("2:10:2"), [2, 4, 6, 8, 10])
+        self.assertEqual(expand_range("2:5"), [2, 3, 4, 5])
+        self.assertEqual(expand_range("3:3"), [3])
+        self.assertEqual(expand_range("2:9:2"), [2, 4, 6, 8])
+
+    def test_descending_and_negative(self):
+        self.assertEqual(expand_range("5:2"), [5, 4, 3, 2])
+        self.assertEqual(expand_range("10:0:-5"), [10, 5, 0])
+        self.assertEqual(expand_range("-1:1:1"), [-1, 0, 1])
+
+    def test_float_steps_are_exact(self):
+        self.assertEqual(expand_range("0.1:0.5:0.1"), [0.1, 0.2, 0.3, 0.4, 0.5])
+        self.assertTrue(all(isinstance(v, float) for v in expand_range("1.0:3:1")))
+        self.assertTrue(all(isinstance(v, int) for v in expand_range("1:3:1")))
+
+    def test_non_numeric_is_not_a_range(self):
+        for text in ("a:b", "C:/data", "1:2:3:4", "x:5", "1:", ":5"):
+            self.assertIsNone(expand_range(text), text)
+
+    def test_all_numeric_colon_text_must_be_quoted(self):
+        with self.assertRaisesRegex(ValueError, "zero"):
+            parse_set("p=12:30:00")
+        self.assertEqual(parse_set('p="12:30:00"').values, ("12:30:00",))
+
+    def test_bad_ranges_raise(self):
+        with self.assertRaisesRegex(ValueError, "zero"):
+            expand_range("1:5:0")
+        with self.assertRaisesRegex(ValueError, "wrong sign"):
+            expand_range("1:5:-1")
+        with self.assertRaisesRegex(ValueError, "limit"):
+            expand_range("0:1000000:1")
+
+
+class ParseSetTests(unittest.TestCase):
+    def test_scalars_are_not_sweeps(self):
+        self.assertEqual(parse_set("p=5").values, (5,))
+        self.assertFalse(parse_set("p=5").sweep)
+        self.assertEqual(parse_set("p=true").values, (True,))
+        self.assertEqual(parse_set("p=hello").values, ("hello",))
+        self.assertEqual(parse_set("p=").values, ("",))
+        self.assertEqual(parse_set("p=a=b").values, ("a=b",))
+
+    def test_json_list_is_a_literal_value(self):
+        spec = parse_set("p=[1,2,3]")
+        self.assertFalse(spec.sweep)
+        self.assertEqual(spec.values, ([1, 2, 3],))
+
+    def test_range_and_list(self):
+        self.assertEqual(parse_set("p=2:6:2").values, (2, 4, 6))
+        self.assertTrue(parse_set("p=2:6:2").sweep)
+        self.assertEqual(parse_set("p=1,2,5").values, (1, 2, 5))
+        self.assertEqual(parse_set("p=1:3,8,10:20:5").values, (1, 2, 3, 8, 10, 15, 20))
+        self.assertEqual(parse_set("p=a,b").values, ("a", "b"))
+        self.assertEqual(parse_set("p=[1,2],[3,4]").values, ([1, 2], [3, 4]))
+        self.assertEqual(parse_set('p="a,b",c').values, ("a,b", "c"))
+
+    def test_colon_strings_and_quoting_stay_literal(self):
+        self.assertEqual(parse_set("p=C:/data/x").values, ("C:/data/x",))
+        self.assertFalse(parse_set("p=C:/data/x").sweep)
+        self.assertEqual(parse_set('p="1:3"').values, ("1:3",))
+        self.assertFalse(parse_set('p="1:3"').sweep)
+
+    def test_job_selector(self):
+        spec = parse_set("J2:class3D_N_K=2:4")
+        self.assertEqual((spec.job, spec.param, spec.values), ("J2", "class3D_N_K", (2, 3, 4)))
+        self.assertEqual(parse_set("class3D_N_K=3").job, "")
+
+    def test_custom_delimiters(self):
+        delims = Delimiters(job="@", range="..", list=";")
+        spec = parse_set("J1@p=1..3;10", delims)
+        self.assertEqual((spec.job, spec.param, spec.values), ("J1", "p", (1, 2, 3, 10)))
+        self.assertEqual(parse_set("p=1:3", delims).values, ("1:3",))
+        with self.assertRaisesRegex(ValueError, "differ"):
+            parse_set("p=1", Delimiters(range=",", list=","))
+
+    def test_malformed(self):
+        for bad in ("noequals", "=5", "J1:=5", "p=1,,2"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_set(bad)
+
+
+class SweepTests(unittest.TestCase):
+    def test_range_without_repeats_copies_template(self):
+        output, combos = apply_sets(template(), ["class3D_N_K=2:4"])
+        self.assertEqual(combos, 3)
+        self.assertEqual(_values(output), [2, 3, 4])
+        self.assertEqual([j["groups"][1][0] for j in output["jobs"].values()], ["P2.imported_mask_1"] * 3)
+        self.assertEqual(output["parents"]["P2"]["groups"]["mask"]["connections"], ["imported_mask_1"])
+
+    def test_single_value_sweep_still_expands_axis(self):
+        output, combos = apply_sets(template(), ["class3D_N_K=5:5"])
+        self.assertEqual((combos, _values(output)), (1, [5]))
+
+    def test_sweep_is_independent_of_n(self):
+        report = {}
+        workflow = repeat_workflow(template(), 2, report=report)
+        output, combos = apply_sets(workflow, ["class3D_N_K=2:4"], origins=report["origins"],
+                                    replicated=report["replicated"])
+        self.assertEqual(combos, 3)
+        self.assertEqual(_values(output), [2, 2, 3, 3, 4, 4])
+        self.assertEqual([j["groups"][1][0] for j in output["jobs"].values()],
+                         ["P2.imported_mask_1", "P2.imported_mask_2"] * 3)
+        self.assertEqual(list(output["jobs"]), [f"J{i}" for i in range(1, 7)])
+        self.assertEqual(output["parents"]["P2"]["groups"]["mask"]["connections"],
+                         ["imported_mask_1", "imported_mask_2"])
+
+    def test_n_one_with_sweep(self):
+        report = {}
+        workflow = repeat_workflow(template(), 1, report=report)
+        output, _ = apply_sets(workflow, ["class3D_N_K=2,4"], origins=report["origins"],
+                               replicated=report["replicated"])
+        self.assertEqual(_values(output), [2, 4])
+
+    def test_product_of_two_axes_first_set_slowest(self):
+        output, combos = apply_sets(template(), ["class3D_N_K=2:3", "class3D_target_res=10,12,14"])
+        self.assertEqual(combos, 6)
+        self.assertEqual(_values(output), [2, 2, 2, 3, 3, 3])
+        self.assertEqual(_values(output, "class3D_target_res"), [10, 12, 14, 10, 12, 14])
+
+    def test_zip_walks_axes_together(self):
+        output, combos = apply_sets(template(), ["class3D_N_K=2:4", "class3D_target_res=10,12,14"],
+                                    combine="zip")
+        self.assertEqual(combos, 3)
+        self.assertEqual(_values(output), [2, 3, 4])
+        self.assertEqual(_values(output, "class3D_target_res"), [10, 12, 14])
+
+    def test_zip_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "equal-length"):
+            apply_sets(template(), ["class3D_N_K=2:4", "class3D_target_res=10,12"], combine="zip")
+
+    def test_scalar_alongside_sweep(self):
+        output, _ = apply_sets(template(), ["class3D_N_K=2:3", "class3D_target_res=11"])
+        self.assertEqual(_values(output, "class3D_target_res"), [11, 11])
+
+    def test_target_uses_source_job_ids(self):
+        sample = template()
+        second = copy.deepcopy(sample["jobs"]["J1"])
+        second["groups"][1][0] = "P2.imported_mask_2"
+        second["groups"][2][0] = "P3.imported_mask_2"
+        second["parameters"]["class3D_N_K"]["value"] = 8        # not a series: block mode
+        sample["jobs"]["J2"] = second
+        report = {}
+        workflow = repeat_workflow(sample, 3, report=report)
+        self.assertEqual(len(workflow["jobs"]), 6)
+        output, combos = apply_sets(workflow, ["J2:class3D_N_K=20,30"], origins=report["origins"],
+                                    replicated=report["replicated"])
+        self.assertEqual(combos, 2)
+        # Only source J2 is swept (3 copies x 2 values); source J1 is left out.
+        self.assertEqual(_values(output), [20, 20, 20, 30, 30, 30])
+        kept, _ = apply_sets(workflow, ["J2:class3D_N_K=20,30"], origins=report["origins"],
+                             replicated=report["replicated"], keep_unswept=True)
+        # With keep_unswept the three J1 copies exist once, after the swept jobs.
+        self.assertEqual(_values(kept), [20, 20, 20, 30, 30, 30, 3, 3, 3])
+
+    def test_target_in_series_selects_whole_series(self):
+        sample = template()
+        second = copy.deepcopy(sample["jobs"]["J1"])
+        second["groups"][1][0] = "P2.imported_mask_2"
+        second["groups"][2][0] = "P3.imported_mask_2"
+        sample["jobs"]["J2"] = second
+        report = {}
+        workflow = repeat_workflow(sample, 4, report=report)          # series extended to 4
+        output, _ = apply_sets(workflow, ["J1:class3D_N_K=2,6"], origins=report["origins"],
+                               replicated=report["replicated"])
+        self.assertEqual(_values(output), [2] * 4 + [6] * 4)
+
+    def test_targeted_value_wins_over_untargeted(self):
+        sample = template()
+        sample["jobs"]["J2"] = copy.deepcopy(sample["jobs"]["J1"])
+        output, _ = apply_sets(sample, ["class3D_N_K=2:3", "J2:class3D_N_K=9"])
+        self.assertEqual(_values(output), [2, 9, 3, 9])
+
+    def test_unknown_or_excluded_job_and_parameter(self):
+        with self.assertRaisesRegex(ValueError, "J9"):
+            apply_sets(template(), ["J9:class3D_N_K=2:4"])
+        with self.assertRaisesRegex(ValueError, "not found"):
+            apply_sets(template(), ["nope=1:3"])
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            apply_sets(template(), ["class3D_N_K=1:2", "class3D_N_K=3"])
+
+    def test_internal_references_follow_each_copy(self):
+        sample = template()
+        child = copy.deepcopy(sample["jobs"]["J1"])
+        child["groups"] = [["J1.class_0", "particles"]]
+        child["parameters"] = {"x": {"value": 1}}
+        sample["jobs"]["J2"] = child
+        output, combos = apply_sets(sample, ["class3D_N_K=2:4"])
+        self.assertEqual(combos, 3)
+        self.assertEqual([output["jobs"][f"J{i}"]["groups"][0][0] for i in (2, 4, 6)],
+                         ["J1.class_0", "J3.class_0", "J5.class_0"])
+
+    def test_remainder_jobs_exist_once_and_only_get_scalars(self):
+        sample = template()
+        extra = copy.deepcopy(sample["jobs"]["J1"])
+        extra["jobType"] = "other"
+        extra["groups"] = [["J1.class_0", "volume"]]
+        sample["jobs"]["J2"] = extra
+        report = {}
+        workflow = repeat_workflow(sample, 2, jobs=["J1"], exclude_remainder_jobs=False, report=report)
+        output, _ = apply_sets(workflow, ["class3D_N_K=2:3", "class3D_target_res=7"],
+                               origins=report["origins"], replicated=report["replicated"],
+                               keep_unswept=True)
+        self.assertEqual(len(output["jobs"]), 5)
+        self.assertEqual(_values(output, "class3D_target_res"), [7] * 5)
+
+    def test_max_jobs_guard(self):
+        with self.assertRaisesRegex(ValueError, "max-jobs"):
+            apply_sets(template(), ["class3D_N_K=1:50"], max_jobs=10)
+
+
+def _two_job_series():
+    sample = template()
+    second = copy.deepcopy(sample["jobs"]["J1"])
+    second["groups"][1][0] = "P2.imported_mask_2"
+    second["groups"][2][0] = "P3.imported_mask_2"
+    sample["jobs"]["J2"] = second
+    return sample
+
+
+class TargetedSweepSelectionTests(unittest.TestCase):
+    def test_targeting_one_of_two_jobs_sweeps_only_that_job(self):
+        report = {}
+        output, combos = apply_sets(_two_job_series(), ["J2:class3D_N_K=2:8:1"], report=report)
+        self.assertEqual((combos, _values(output)), (7, [2, 3, 4, 5, 6, 7, 8]))
+        self.assertEqual({j["groups"][1][0] for j in output["jobs"].values()}, {"P2.imported_mask_2"})
+        self.assertEqual(report["dropped"], ["J1"])
+
+    def test_include_remainder_keeps_the_other_job_once(self):
+        output, combos = apply_sets(_two_job_series(), ["J2:class3D_N_K=2:8:1"], keep_unswept=True)
+        self.assertEqual(combos, 7)
+        self.assertEqual(len(output["jobs"]), 8)
+        self.assertEqual(_values(output)[-1], 3)
+
+    def test_n_one_collapses_the_series_so_the_target_selects_it(self):
+        report = {}
+        workflow = repeat_workflow(_two_job_series(), 1, report=report)
+        self.assertEqual(len(workflow["jobs"]), 1)
+        output, combos = apply_sets(workflow, ["J2:class3D_N_K=2:8:1"], origins=report["origins"],
+                                    replicated=report["replicated"])
+        self.assertEqual((combos, len(output["jobs"])), (7, 7))
+
+    def test_untargeted_sweep_only_copies_jobs_that_have_the_parameter(self):
+        sample = _two_job_series()
+        del sample["jobs"]["J2"]["parameters"]["class3D_N_K"]
+        output, combos = apply_sets(sample, ["class3D_N_K=2:4"])
+        self.assertEqual((combos, len(output["jobs"])), (3, 3))
+
+    def test_downstream_jobs_are_copied_with_the_swept_job(self):
+        sample = template()
+        child = copy.deepcopy(sample["jobs"]["J1"])
+        child["groups"] = [["J1.class_0", "particles"]]
+        child["parameters"] = {"x": {"value": 1}}
+        sample["jobs"]["J2"] = child
+        output, combos = apply_sets(sample, ["J1:class3D_N_K=2:3"])
+        self.assertEqual((combos, len(output["jobs"])), (2, 4))
+        self.assertEqual(output["jobs"]["J4"]["groups"][0][0], "J3.class_0")
+
+    def test_swept_job_using_an_unswept_upstream_job_is_an_error(self):
+        sample = template()
+        child = copy.deepcopy(sample["jobs"]["J1"])
+        child["groups"] = [["J1.class_0", "particles"]]
+        sample["jobs"]["J2"] = child
+        with self.assertRaisesRegex(ValueError, "J1.*include-remainder-jobs"):
+            apply_sets(sample, ["J2:class3D_N_K=2:3"])
+        output, _ = apply_sets(sample, ["J2:class3D_N_K=2:3"], keep_unswept=True)
+        self.assertEqual(len(output["jobs"]), 3)
+        self.assertEqual(output["jobs"]["J1"]["groups"][0][0], "J3.class_0")
+
+    def test_scalar_on_a_left_out_job_explains_why(self):
+        with self.assertRaisesRegex(ValueError, "include-remainder-jobs"):
+            apply_sets(_two_job_series(), ["J2:class3D_N_K=2:3", "J1:class3D_target_res=9"])
+        output, _ = apply_sets(_two_job_series(), ["J2:class3D_N_K=2:3", "J1:class3D_target_res=9"],
+                               keep_unswept=True)
+        self.assertEqual(_values(output, "class3D_target_res")[-1], 9)
+
+    def test_cli_reports_left_out_jobs_and_include_flag_works_without_n(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "two.json").write_text(json.dumps(_two_job_series()))
+            run = _run(["two.json", "--set", "J2:class3D_N_K=2:8:1", "-o", "a.json"], directory)
+            self.assertEqual(len(json.loads(Path(directory, "a.json").read_text())["jobs"]), 7)
+            self.assertIn("left out J1", run.stderr)
+            run = _run(["two.json", "--include-remainder-jobs", "--set", "J2:class3D_N_K=2:8:1",
+                        "-o", "b.json"], directory)
+            self.assertEqual(len(json.loads(Path(directory, "b.json").read_text())["jobs"]), 8)
+            self.assertEqual(run.stderr, "")
+            run = _run(["two.json", "-n", "1", "--set", "J2:class3D_N_K=2:8:1", "-o", "c.json"], directory)
+            self.assertEqual(len(json.loads(Path(directory, "c.json").read_text())["jobs"]), 7)
+
+
+class SweepCliTests(unittest.TestCase):
+    def test_cli_sweep_with_n_and_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _run(["-n", "2", "--set", "class3D_N_K=2:4"], directory)
+            output = Path(directory) / "workflow_repeated_2_class3D_N_K_2_4.json"
+            result = json.loads(output.read_text())
+            self.assertEqual(_values(result), [2, 2, 3, 3, 4, 4])
+            self.assertEqual(result["title"],
+                             "class_3D repeated 2 times x 3 parameter combinations class3D_N_K=2:4")
+
+    def test_cli_sweep_without_n(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _run(["--set", "class3D_N_K=2,4,8", "-o", "out.json"], directory)
+            result = json.loads((Path(directory) / "out.json").read_text())
+            self.assertEqual(_values(result), [2, 4, 8])
+            self.assertEqual(result["title"], "class_3D x 3 parameter combinations class3D_N_K=2,4,8")
+
+    def test_cli_parents_none_replicates_without_advancing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _run(["-n", "3", "--parents", "none", "-o", "out.json"], directory)
+            result = json.loads((Path(directory) / "out.json").read_text())
+            self.assertEqual(len(result["jobs"]), 3)
+            self.assertEqual({j["groups"][1][0] for j in result["jobs"].values()}, {"P2.imported_mask_1"})
+            _run(["-n", "3", "--parents", "none", "--set", "class3D_N_K=2:3", "-o", "out2.json"], directory)
+            result = json.loads((Path(directory) / "out2.json").read_text())
+            self.assertEqual(_values(result), [2, 2, 2, 3, 3, 3])
+            self.assertEqual({j["groups"][1][0] for j in result["jobs"].values()}, {"P2.imported_mask_1"})
+
+    def test_cli_parents_none_cannot_mix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(["-n", "2", "--parents", "none", "P1"], directory, check=False)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("none", run.stderr)
+
+    def test_cli_zip_and_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _run(["--set", "class3D_N_K=2:4", "--set", "class3D_target_res=10,12,14",
+                  "--combine", "zip", "-o", "zip.json"], directory)
+            self.assertEqual(len(json.loads((Path(directory) / "zip.json").read_text())["jobs"]), 3)
+            _run(["--set", "class3D_N_K=2:4", "--set", "class3D_target_res=10,12,14",
+                  "-o", "prod.json"], directory)
+            self.assertEqual(len(json.loads((Path(directory) / "prod.json").read_text())["jobs"]), 9)
+            run = _run(["--set", "class3D_N_K=2:4", "--set", "class3D_target_res=10,12",
+                        "--combine", "zip", "-o", "bad.json"], directory, check=False)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertFalse((Path(directory) / "bad.json").exists())
+
+    def test_cli_custom_delimiters_and_job_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _run(["--job-sep", "@", "--range-sep", "..", "--list-sep", ";",
+                  "--set", "J1@class3D_N_K=2..4;9", "-o", "out.json"], directory)
+            self.assertEqual(_values(json.loads((Path(directory) / "out.json").read_text())),
+                             [2, 3, 4, 9])
+
+    def test_cli_max_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(["--set", "class3D_N_K=1:20", "--max-jobs", "5"], directory, check=False)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("--max-jobs", run.stderr)
+            run = _run(["--set", "class3D_N_K=1:20", "--max-jobs", "20", "-o", "ok.json"], directory)
+            self.assertEqual(len(json.loads((Path(directory) / "ok.json").read_text())["jobs"]), 20)
+
+    def test_cli_options_requiring_n_are_rejected_without_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(["--parents", "none", "--set", "class3D_N_K=2:3"], directory, check=False)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("-n", run.stderr)
 
 
 if __name__ == "__main__":

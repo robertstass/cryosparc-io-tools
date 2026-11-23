@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import re
 import secrets
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -227,7 +230,8 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
                     jobs: list[str] | None = None,
                     no_series_extension: bool = False,
                     exclude_remainder_jobs: bool = True,
-                    selected_parents: list[str] | None = None) -> dict[str, Any]:
+                    selected_parents: list[str] | None = None,
+                    report: dict[str, Any] | None = None) -> dict[str, Any]:
     """Extend uniform series to N jobs, otherwise repeat selected jobs N times.
 
     The default series extension requires >=2 identical jobs varying only by
@@ -235,7 +239,12 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
     Otherwise N means copies of each selected job. Unselected jobs are excluded
     by default. If selected_parents is supplied, only indexed connections from
     those parents advance; all other parent inputs remain as in the source job
-    (or the first series job when extending a series).
+    (or the first series job when extending a series). An empty selected_parents
+    list means *no* numbered connection advances (pure replication).
+
+    If a dict is passed as ``report`` it is filled with ``origins`` (generated
+    job ID -> set of source job IDs it came from) and ``replicated`` (the
+    generated, non-remainder job IDs in order), which :func:`apply_sets` uses.
     """
     if repeats < 1:
         raise ValueError("--repeats must be a positive integer")
@@ -247,9 +256,7 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
     if not isinstance(parents, dict):
         raise ValueError("Input JSON 'parents' must be an object")
     parent_filter = set(selected_parents) if selected_parents is not None else None
-    if parent_filter is not None:
-        if not parent_filter:
-            raise ValueError("--parents must specify at least one parent")
+    if parent_filter:
         unknown_parents = sorted(parent_filter - set(parents))
         if unknown_parents:
             raise ValueError("Unknown parent ID(s): " + ", ".join(unknown_parents))
@@ -300,7 +307,7 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
     else:
         indices = sorted({index for name, job in selected.items()
                           for index in _job_indices(job, parents, parent_filter, active_for(name))})
-        if parent_filter is not None and not indices:
+        if parent_filter and not indices:
             raise ValueError("No numbered parent outputs from --parents are used by the selected jobs")
     index_position = {value: position for position, value in enumerate(indices)}
     width = len(indices)
@@ -318,6 +325,7 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
 
     sorted_names = sorted(selected_names, key=rank)
     generated: dict[str, Any] = {}
+    origins: dict[str, set[str]] = {}
     first_id_map: dict[str, str] = {}
     remainder_names = [name for name in original_names if name not in selected and not exclude_remainder_jobs]
     # Generate selected first, then unselected jobs. No original job IDs are reused.
@@ -357,6 +365,9 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
                 selected[base_name], {}, remainder_map, active_positions=varying_positions,
                 slot_targets={position: slot_starts[position] + i for position in varying_positions}
             )
+            # Series members are identical apart from their indices, so any of
+            # them identifies the whole generated series.
+            origins[f"J{i + 1}"] = set(series_names)
         # Remainder references to original series jobs map to corresponding
         # indices when present, or to the final generated job if N is smaller.
         for i, name in enumerate(series_names):
@@ -380,49 +391,354 @@ def repeat_workflow(workflow: dict[str, Any], repeats: int, *,
                     selected[old], indices_for_copy, combined_map,
                     active_positions=active_for(old), slot_targets=targets
                 )
+                origins[id_map[old]] = {old}
 
+    replicated = list(generated)
     if remainder_names:
         all_maps = {**first_id_map, **remainder_map}
         for old in remainder_names:
             generated[remainder_map[old]] = rewrite(original_jobs[old], {}, all_maps)
+            origins[remainder_map[old]] = {old}
     result["jobs"] = generated
     _reconcile_parents(generated, parents)
+    if report is not None:
+        report["origins"] = origins
+        report["replicated"] = replicated
     return result
 
-def set_parameters(workflow: dict[str, Any], overrides: list[str]) -> None:
-    """Apply parameter.value updates to each matching job (or a selected job).
 
-    Syntax: PARAM=JSON_VALUE or JOB_ID:PARAM=JSON_VALUE.
-    Values are parsed as JSON first; otherwise treated as literal strings.
+@dataclass(frozen=True)
+class Delimiters:
+    """Characters used to parse --set values; override them if a value needs them."""
+    job: str = ":"      # JOB:PARAM=VALUE
+    range: str = ":"    # start:stop[:step]
+    list: str = ","     # a,b,c  (items may themselves be ranges)
+
+    def validate(self) -> None:
+        for label, value in (("job", self.job), ("range", self.range), ("list", self.list)):
+            if not value or "=" in value:
+                raise ValueError(f"--{label}-sep must be a non-empty string without '='")
+        if self.range == self.list:
+            raise ValueError("--range-sep and --list-sep must differ")
+
+
+@dataclass(frozen=True)
+class SetSpec:
+    """One parsed --set. ``sweep`` is True for ranges and lists (an iteration axis)."""
+    text: str
+    job: str
+    param: str
+    values: tuple
+    sweep: bool
+
+
+MAX_AXIS_VALUES = 100_000
+_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _split_top_level(text: str, sep: str) -> list[str]:
+    """Split on ``sep`` outside of JSON brackets, braces and double quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quoted = escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quoted:
+            quoted = not (ch == '"' and not escaped)
+            escaped = ch == "\\" and not escaped
+        elif ch == '"':
+            quoted = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(sep, i):
+            parts.append("".join(current))
+            current = []
+            i += len(sep)
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _number(text: str) -> tuple[Decimal, bool] | None:
+    """Parse a plain number into (exact value, written-as-float), else None."""
+    text = text.strip()
+    if _NUMBER.fullmatch(text) is None:
+        return None
+    try:
+        return Decimal(text), any(ch in text for ch in ".eE")
+    except InvalidOperation:  # pragma: no cover - guarded by the regex
+        return None
+
+
+def expand_range(item: str, range_sep: str = ":") -> list[int | float] | None:
+    """Expand ``start:stop[:step]`` (stop **inclusive**), or None if not a numeric range.
+
+    The step defaults to 1 (or -1 when stop < start). Integers stay integers;
+    any float in the text gives floats computed exactly with Decimal, so
+    ``0.1:0.5:0.1`` is 0.1, 0.2, 0.3, 0.4, 0.5.
     """
-    for override in overrides:
-        if "=" not in override:
-            raise ValueError(f"Invalid --set {override!r}: expected PARAM=VALUE")
-        selector, raw = override.split("=", 1)
-        job_id, sep, param = selector.partition(":")
-        if not sep:
-            job_id, param = "", job_id
-        if not param:
-            raise ValueError(f"Invalid --set {override!r}: parameter is missing")
+    parts = item.split(range_sep)
+    if len(parts) not in (2, 3):
+        return None
+    numbers = [_number(part) for part in parts]
+    if any(number is None for number in numbers):
+        return None
+    start, stop = numbers[0][0], numbers[1][0]
+    as_float = any(number[1] for number in numbers)
+    if len(numbers) == 3:
+        step = numbers[2][0]
+    else:
+        step = Decimal(1) if stop >= start else Decimal(-1)
+    if step == 0:
+        raise ValueError(f"Invalid range {item!r}: step must not be zero")
+    if (stop - start) * step < 0:
+        raise ValueError(f"Invalid range {item!r}: step has the wrong sign to reach stop")
+    count = int((stop - start) // step) + 1
+    if count > MAX_AXIS_VALUES:
+        raise ValueError(f"Range {item!r} expands to {count} values (limit {MAX_AXIS_VALUES})")
+    values = [start + step * i for i in range(count)]
+    return [float(v) if as_float else int(v) for v in values]
+
+
+def _literal(text: str) -> Any:
+    """JSON if it parses, otherwise the text itself."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def parse_set(override: str, delims: Delimiters | None = None) -> SetSpec:
+    """Parse ``[JOB:]PARAM=VALUE`` where VALUE is a scalar, range or list.
+
+    * ``5``, ``12.5``, ``true``, ``'"text"'``, ``[1,2]`` - one literal value
+    * ``2:10:2`` or ``2:10`` - numeric range, stop inclusive (a sweep)
+    * ``2,4,8`` - curated list; items may be ranges: ``1:3,8,10:20:5`` (a sweep)
+
+    A colon-separated value is only a range when every piece is a number, so
+    text such as ``C:/data`` stays literal. All-numeric text that is not meant
+    as a range (``12:30:00``) is rejected as a bad range; JSON-quote it
+    (``'"12:30:00"'``) to force it literal. JSON lists (``[1,2]``) are literal
+    list-valued parameters, never sweeps.
+    """
+    delims = delims or Delimiters()
+    delims.validate()
+    if "=" not in override:
+        raise ValueError(f"Invalid --set {override!r}: expected PARAM=VALUE")
+    selector, raw = override.split("=", 1)
+    job, sep, param = selector.partition(delims.job)
+    if not sep:
+        job, param = "", selector
+    job, param = job.strip(), param.strip()
+    if not param:
+        raise ValueError(f"Invalid --set {override!r}: parameter is missing")
+    items = _split_top_level(raw, delims.list)
+    if len(items) == 1:
+        item = raw.strip()
         try:
-            value = json.loads(raw)
+            return SetSpec(override, job, param, (json.loads(item),), False)
         except json.JSONDecodeError:
-            value = raw
-        matches = 0
-        for current_id, job in workflow.get("jobs", {}).items():
-            if job_id and current_id != job_id:
-                continue
-            record = job.get("parameters", {}).get(param)
-            if isinstance(record, dict) and "value" in record:
-                record["value"] = value
-                matches += 1
-        if not matches:
-            raise ValueError(f"Parameter {param!r} not found in " + (job_id or "any job"))
+            pass
+        expanded = expand_range(item, delims.range)
+        if expanded is None:
+            return SetSpec(override, job, param, (raw,), False)
+        return SetSpec(override, job, param, tuple(expanded), True)
+    values: list[Any] = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            raise ValueError(f"Invalid --set {override!r}: empty item in list")
+        try:
+            values.append(json.loads(item))
+            continue
+        except json.JSONDecodeError:
+            pass
+        expanded = expand_range(item, delims.range)
+        values.extend(expanded if expanded is not None else [item])
+    if len(values) > MAX_AXIS_VALUES:
+        raise ValueError(f"--set {override!r} expands to {len(values)} values (limit {MAX_AXIS_VALUES})")
+    return SetSpec(override, job, param, tuple(values), True)
 
 
-def update_metadata(workflow: dict[str, Any], repeats: int, overrides: list[str], *,
+def _has_value(job: dict[str, Any], param: str) -> bool:
+    record = job.get("parameters", {}).get(param)
+    return isinstance(record, dict) and "value" in record
+
+
+def _providers(job: dict[str, Any]) -> set[str]:
+    """IDs of the jobs (J-names) whose outputs this job uses."""
+    found: set[str] = set()
+    for pair in job.get("groups", []):
+        if isinstance(pair, list) and pair and isinstance(pair[0], str) and "." in pair[0]:
+            provider = pair[0].split(".", 1)[0]
+            if JOB_NAME.fullmatch(provider):
+                found.add(provider)
+    return found
+
+
+def _remap_job_references(job: dict[str, Any], id_map: dict[str, str]) -> dict[str, Any]:
+    rewritten = copy.deepcopy(job)
+    for pair in rewritten.get("groups", []):
+        if isinstance(pair, list) and pair and isinstance(pair[0], str) and "." in pair[0]:
+            provider, output = pair[0].split(".", 1)
+            if provider in id_map:
+                pair[0] = f"{id_map[provider]}.{output}"
+    return rewritten
+
+
+def apply_sets(workflow: dict[str, Any], overrides: list[str], *,
+               origins: dict[str, set[str]] | None = None,
+               replicated: list[str] | None = None,
+               combine: str = "product",
+               delims: Delimiters | None = None,
+               max_jobs: int = 1000,
+               keep_unswept: bool = False,
+               report: dict[str, Any] | None = None) -> tuple[dict[str, Any], int | None]:
+    """Apply --set overrides, expanding ranges and lists into extra jobs.
+
+    Returns ``(workflow, combinations)``; ``combinations`` is None when nothing
+    was swept. A scalar ``--set`` just changes a value. Each range or list is an
+    **axis**; the replicated jobs are copied once per combination of axis values
+    (``combine="product"``: every combination, first ``--set`` varying slowest;
+    ``"zip"``: axes advance together and must be the same length).
+
+    ``JOB:PARAM=...`` names a job of the **source** workflow (``origins`` maps
+    generated IDs to source IDs; without it the IDs are used as given). An
+    untargeted ``PARAM=...`` applies to every job that has the parameter, and
+    targeted values are applied after untargeted ones.
+
+    Only the jobs a sweep changes, plus every job downstream of them, are
+    copied per combination. Other jobs (including those outside
+    ``replicated``) are left out, or with ``keep_unswept`` kept once after the
+    copies; they only receive scalar values. A copied job that uses a left-out
+    job is an error. ``report["dropped"]`` lists the source IDs left out.
+    """
+    if combine not in ("product", "zip"):
+        raise ValueError("combine must be 'product' or 'zip'")
+    delims = delims or Delimiters()
+    specs = [parse_set(override, delims) for override in overrides]
+    jobs = workflow.get("jobs", {})
+    if origins is None:
+        origins = {name: {name} for name in jobs}
+    if replicated is None:
+        replicated = list(jobs)
+    replicated = sorted(replicated, key=lambda n: int(JOB_NAME.fullmatch(n).group(1))
+                        if JOB_NAME.fullmatch(n) else 0)
+    seen: set[tuple[str, str]] = set()
+    for spec in specs:
+        if (spec.job, spec.param) in seen:
+            raise ValueError(f"--set for {spec.param!r}"
+                             + (f" on {spec.job}" if spec.job else "") + " given more than once")
+        seen.add((spec.job, spec.param))
+
+    def reach(spec: SetSpec, pool: list[str]) -> list[str]:
+        return [name for name in pool
+                if (not spec.job or spec.job in origins.get(name, {name}))
+                and _has_value(jobs[name], spec.param)]
+
+    axes = [index for index, spec in enumerate(specs) if spec.sweep]
+    result = copy.deepcopy(workflow)
+    ordered = ([i for i, s in enumerate(specs) if not s.job]
+               + [i for i, s in enumerate(specs) if s.job])
+    if not axes:
+        for spec in specs:
+            if not reach(spec, list(jobs)):
+                where = f"source job {spec.job}" if spec.job else "any job"
+                raise ValueError(f"Parameter {spec.param!r} not found in {where}")
+        for index in ordered:
+            for name in reach(specs[index], list(jobs)):
+                result["jobs"][name]["parameters"][specs[index].param]["value"] = specs[index].values[0]
+        return result, None
+
+    # Copy the jobs a sweep changes and everything downstream of them.
+    targets: dict[int, list[str]] = {}
+    swept: set[str] = set()
+    for index in axes:
+        spec = specs[index]
+        targets[index] = reach(spec, replicated)
+        if not targets[index]:
+            where = f"source job {spec.job}" if spec.job else "any repeated job"
+            raise ValueError(f"Parameter {spec.param!r} not found in {where}")
+        swept.update(targets[index])
+    grown = True
+    while grown:
+        grown = False
+        for name in replicated:
+            if name not in swept and _providers(jobs[name]) & swept:
+                swept.add(name)
+                grown = True
+    block = [name for name in replicated if name in swept]
+    rest = [name for name in jobs if name not in swept] if keep_unswept else []
+    dropped = [name for name in jobs if name not in swept and name not in rest]
+    for name in block + rest:
+        missing = _providers(jobs[name]) & set(dropped)
+        if missing:
+            raise ValueError(f"{name} uses {', '.join(sorted(missing))}, which no sweep changes; "
+                             "add --include-remainder-jobs to keep such jobs once")
+    for index in range(len(specs)):
+        if index not in targets:
+            targets[index] = reach(specs[index], block + rest)
+            if not targets[index]:
+                where = f"source job {specs[index].job}" if specs[index].job else "any kept job"
+                raise ValueError(f"Parameter {specs[index].param!r} not found in {where}"
+                                 + (" (it is not swept; add --include-remainder-jobs to keep it)"
+                                    if dropped else ""))
+    if report is not None:
+        report["dropped"] = sorted({src for name in dropped for src in origins.get(name, {name})})
+
+    lengths = [len(specs[i].values) for i in axes]
+    if combine == "zip":
+        if len(set(lengths)) != 1:
+            detail = ", ".join(f"{specs[i].text} ({n})" for i, n in zip(axes, lengths))
+            raise ValueError("--combine zip needs equal-length sweeps: " + detail)
+        combos = list(zip(*(specs[i].values for i in axes)))
+        count = lengths[0]
+    else:
+        count = 1
+        for n in lengths:
+            count *= n
+        combos = None
+    total = count * len(block) + len(rest)
+    if total > max_jobs:
+        raise ValueError(f"This would generate {total} jobs (limit {max_jobs}); "
+                         "raise --max-jobs if that is intended")
+    if combos is None:
+        combos = list(itertools.product(*(specs[i].values for i in axes)))
+    axis_slot = {spec_index: slot for slot, spec_index in enumerate(axes)}
+
+    width = len(block)
+    rest_map = {old: f"J{count * width + i + 1}" for i, old in enumerate(rest)}
+    first_map = {old: f"J{i + 1}" for i, old in enumerate(block)}
+    expanded: dict[str, Any] = {}
+    for c in range(count):
+        id_map = {old: f"J{c * width + i + 1}" for i, old in enumerate(block)}
+        for old in block:
+            expanded[id_map[old]] = _remap_job_references(jobs[old], {**rest_map, **id_map})
+    for old in rest:
+        expanded[rest_map[old]] = _remap_job_references(jobs[old], {**first_map, **rest_map})
+    result["jobs"] = expanded
+
+    def new_id(c: int, old: str) -> str:
+        return rest_map[old] if old in rest_map else f"J{c * width + block.index(old) + 1}"
+
+    for c, combo in enumerate(combos):
+        for index in ordered:
+            spec = specs[index]
+            value = combo[axis_slot[index]] if spec.sweep else spec.values[0]
+            for old in targets[index]:
+                expanded[new_id(c, old)]["parameters"][spec.param]["value"] = value
+    return result, count
+
+
+def update_metadata(workflow: dict[str, Any], repeats: int | None, overrides: list[str], *,
                     update_id: bool = True, update_date: bool = True,
-                    update_title: bool = True) -> None:
+                    update_title: bool = True, combinations: int | None = None) -> None:
     """Refresh top-level metadata for a newly generated workflow."""
     if update_id:
         # CryoSPARC workflow IDs are 24-character hexadecimal identifiers.
@@ -433,7 +749,9 @@ def update_metadata(workflow: dict[str, Any], repeats: int, overrides: list[str]
         kinds = sorted({job.get("jobType", "unknown") for job in workflow["jobs"].values()})
         kind_label = ", ".join(kinds)
         edits = f" {' '.join(overrides)}" if overrides else ""
-        workflow["title"] = f"{kind_label} repeated {repeats} times{edits}"
+        repeated = f" repeated {repeats} times" if repeats is not None else ""
+        swept = f" x {combinations} parameter combinations" if combinations is not None else ""
+        workflow["title"] = f"{kind_label}{repeated}{swept}{edits}"
 
 
 def filename_override_suffix(overrides: list[str]) -> str:
@@ -443,7 +761,7 @@ def filename_override_suffix(overrides: list[str]) -> str:
         selector, value = override.split("=", 1)
         # Include a job selector, if supplied, to avoid ambiguous names.
         label = f"{selector}_{value}"
-        label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._-")
+        label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._-")[:48].rstrip("._-")
         parts.append(label or "set")
     return "_" + "_".join(parts) if parts else ""
 
@@ -462,12 +780,27 @@ def main(argv: list[str] | None = None) -> int:
                                    action="store_const", const=True, help="Discard unselected jobs (default)")
     parser.add_argument("--parents", nargs="+", action="append", metavar="PID",
                         help="Only advance numbered outputs of these parents, e.g. P1 P2; "
-                             "other parents' inputs stay fixed (default: all parents)")
+                             "other parents' inputs stay fixed (default: all parents). "
+                             "Use '--parents none' so no connection advances (plain replication)")
     parser.add_argument("--no-series-extension", action="store_true",
                         help="Disable series detection: always make N copies of each selected job")
     parser.add_argument("-o", "--output", type=Path, help="Output JSON path (default: workflow.json or INPUT_STEM_repeated_N[_PARAM_VALUE].json)")
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="PARAM=VALUE",
-                        help="Override job parameter value, optionally J1:PARAM=VALUE; repeatable")
+                        help="Override a parameter. VALUE may be a scalar, a range START:STOP[:STEP] "
+                             "(stop inclusive), or a list A,B,C (items may be ranges) which expands "
+                             "into extra jobs. Optionally JOB:PARAM=VALUE, where JOB is a job ID in "
+                             "the source workflow; repeatable")
+    parser.add_argument("--combine", choices=("product", "zip"), default="product",
+                        help="How several ranged/listed --set values combine: every combination "
+                             "(product, default) or in lockstep (zip, equal lengths required)")
+    parser.add_argument("--job-sep", default=Delimiters.job, metavar="STR",
+                        help="Separator between JOB and PARAM in --set (default ':')")
+    parser.add_argument("--range-sep", default=Delimiters.range, metavar="STR",
+                        help="Separator inside START:STOP:STEP ranges (default ':')")
+    parser.add_argument("--list-sep", default=Delimiters.list, metavar="STR",
+                        help="Separator between list items in --set values (default ',')")
+    parser.add_argument("--max-jobs", type=int, default=1000, metavar="N",
+                        help="Refuse to write more than N jobs from a sweep (default 1000)")
     parser.add_argument("--no-id-update", action="store_true", help="Preserve the input workflow _id")
     parser.add_argument("--no-date-update", dest="no_date_update", action="store_true",
                         help="Preserve createdAt")
@@ -477,6 +810,9 @@ def main(argv: list[str] | None = None) -> int:
         workflow = json.loads(args.input.read_text(encoding="utf-8")) if args.input else template()
         if not isinstance(workflow, dict):
             raise ValueError("Top-level JSON must be an object")
+        delims = Delimiters(job=args.job_sep, range=args.range_sep, list=args.list_sep)
+        delims.validate()
+        report: dict[str, Any] = {}
         if args.repeats is not None:
             selected_jobs = ([item.strip() for group in args.jobs for token in group
                               for item in token.split(",") if item.strip()]
@@ -484,20 +820,32 @@ def main(argv: list[str] | None = None) -> int:
             parent_ids = ([item.strip() for group in args.parents for token in group
                            for item in token.split(",") if item.strip()]
                           if args.parents else None)
+            if parent_ids is not None and any(item.lower() == "none" for item in parent_ids):
+                if len(parent_ids) > 1:
+                    raise ValueError("--parents none cannot be combined with parent IDs")
+                parent_ids = []
             workflow = repeat_workflow(workflow, args.repeats, jobs=selected_jobs,
                                        no_series_extension=args.no_series_extension,
                                        exclude_remainder_jobs=(True if args.remainder_choice is None
                                                                else args.remainder_choice),
-                                       selected_parents=parent_ids)
-        if args.repeats is None and (args.jobs or args.parents or args.no_series_extension
-                                    or args.remainder_choice is not None):
-            raise ValueError("--jobs, --parents, remainder options and --no-series-extension require --repeats")
-        set_parameters(workflow, args.overrides)
-        if args.repeats is not None:
+                                       selected_parents=parent_ids, report=report)
+        if args.repeats is None and (args.jobs or args.parents or args.no_series_extension):
+            raise ValueError("--jobs, --parents and --no-series-extension require --repeats (-n)")
+        workflow, combinations = apply_sets(
+            workflow, args.overrides, origins=report.get("origins"),
+            replicated=report.get("replicated"), combine=args.combine,
+            delims=delims, max_jobs=args.max_jobs,
+            keep_unswept=args.remainder_choice is False, report=report)
+        if report.get("dropped"):
+            print(f"note: left out {', '.join(report['dropped'])}: no sweep changes "
+                  "them or anything downstream (--include-remainder-jobs keeps them once)",
+                  file=sys.stderr)
+        if args.repeats is not None or combinations is not None:
             update_metadata(workflow, args.repeats, args.overrides,
                             update_id=not args.no_id_update,
                             update_date=not args.no_date_update,
-                            update_title=not args.no_title_update)
+                            update_title=not args.no_title_update,
+                            combinations=combinations)
         stem = args.input.stem if args.input else "workflow"
         suffix = filename_override_suffix(args.overrides)
         default_name = (f"{stem}_repeated_{args.repeats}{suffix}.json"

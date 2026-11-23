@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cryosparc-io-tools"
-version = "0.1.0"
-description = "Small, dependency-free utilities for CryoSPARC workflow JSON files"
+version = "0.2.0"
+description = "Small utilities for CryoSPARC files: workflow repeater, .cs particle counter, .csg YAML grep"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "CryoSPARC IO Tools contributors"}]
-dependencies = []
+dependencies = ["numpy>=1.20", "pyyaml>=5.1"]
 
 [project.scripts]
 cryosparc-workflow-repeat = "cryosparc_io_tools.cryosparc_workflow_repeat:main"
+cryosparc-cs-count = "cryosparc_io_tools.cryosparc_cs_count:main"
+cryosparc-csg-grep = "cryosparc_io_tools.cryosparc_csg_grep:main"
+cryosparc-io-tools-test = "cryosparc_io_tools.run_tests:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

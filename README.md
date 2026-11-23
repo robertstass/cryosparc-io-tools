@@ -1,231 +1,136 @@
 # cryosparc-io-tools
 
-Tools for editing CryoSPARC files. 
+Small command-line tools for CryoSPARC files.
 
-The first tool (an only so far), `cryosparc_workflow_repeat.py`, repeats workflow jobs and updates
-indexed parent input connections. Think of it like a for loop for CryoSPARC. 
+| Tool | Does |
+| --- | --- |
+| `cryosparc_workflow_repeat.py` | Repeat workflow jobs and sweep parameters, like a for loop for CryoSPARC. |
+| `cryosparc_cs_count.py` | Count the particles in `.cs` files. |
+| `cryosparc_csg_grep.py` | Pull values out of `.csg` (or any YAML) files by key path. |
 
-## Quick start
+## Install
 
-Python **3.10+** is required. No third-party runtime dependencies or CryoSPARC
-installation are needed.
+Python 3.10+. Run straight from a checkout, or install (`uv tool install -e .` or `python -m pip install .`) to get the commands `cryosparc-workflow-repeat`, `cryosparc-cs-count`, `cryosparc-csg-grep` and `cryosparc-io-tools-test`.
 
-From the repository root, without installing:
+The workflow repeater has no dependencies. `cs_count` needs **numpy** and `csg_grep` needs **PyYAML** (both installed with the package).
 
-```bash
-# Export the bundled example unchanged so you can edit it
-python cryosparc_workflow_repeat.py
-
-# Generate 12 Class 3D jobs from the bundled single-job template
-python cryosparc_workflow_repeat.py --repeats 12 --output class_3d_12.json
-
-# Use your own workflow and change the number of 3D classes in every job
-python cryosparc_workflow_repeat.py my_workflow.json -n 12 \
-  --set class3D_N_K=5 -o edited_workflow.json
-```
-
-Or install it as a package (optional):
+## cryosparc_workflow_repeat.py
 
 ```bash
-python -m pip install .
-cryosparc-workflow-repeat -n 12 -o class_3d_12.json
+python cryosparc_workflow_repeat.py                              # export the bundled example template
+python cryosparc_workflow_repeat.py -n 12 -o class_3d_12.json    # 12 jobs from the template
+python cryosparc_workflow_repeat.py my.json -n 12 --set class3D_N_K=5
+python cryosparc_workflow_repeat.py my.json -n 12 --set class3D_N_K=2:10:2   # sweep (see below)
 ```
 
-or install with uv:
-
-```bash
-uv tool install -e .
-```
-
-## CLI options
+With no `-n` and no sweep the input is written unchanged (apart from scalar `--set` values), so you can export a template and edit it. Input files are never overwritten.
 
 | Option | Meaning |
 | --- | --- |
-| `input` (optional) | Existing workflow JSON; default is the bundled `class_3d_template.json`. |
-| `-n, --repeats N` | For a recognized uniform series, generate **N final series jobs**. Otherwise repeat each selected job N times. |
-| `--no-series-extension` | Always use the original N-copies-per-selected-job behavior (2 selected jobs with `-n 5` gives 10 repeated jobs). |
-| `--jobs J1 J2` | Repeat only these job IDs (also accepts `--jobs J1,J2`); can be specified more than once. Default: all jobs. |
-| `--exclude-remainder-jobs` | Exclude unselected jobs (the default). Mutually exclusive with `--include-remainder-jobs`. |
-| `--include-remainder-jobs` | Keep jobs not listed in `--jobs` once, after generated jobs. Mutually exclusive with `--exclude-remainder-jobs`. |
-| `--parents P1 P2` | Advance numbered input connections only for the named parents; leave connections from other parents fixed. Accepts `--parents P1,P2` too. Default: **all parents**. |
-| `-o, --output FILE` | Output path; defaults to `workflow.json` (no input/repeats), or `<input-stem>_repeated_N[_PARAM_VALUE].json` with input and repeats. `--set` overrides are included in the default filename. |
-| `--set PARAM=VALUE` | Set the JSON `value` of matching parameters in all output jobs; repeat as needed. |
-| `--set J1:PARAM=VALUE` | Override a parameter on a specific **output** job only. |
-| `--no-id-update` | Preserve the source `_id`. |
-| `--no-date-update` | Preserve `createdAt`. |
-| `--no-title-update` | Preserve the source title. |
+| `input` | Workflow JSON (default: bundled `class_3d_template.json`). |
+| `-n, --repeats N` | Series of identical-but-for-index jobs: extend to **N jobs**. Otherwise: N copies of each selected job. |
+| `--no-series-extension` | Always use N copies per selected job. |
+| `--jobs J1 J2` | Only repeat these jobs (default: all). |
+| `--include-remainder-jobs` / `--exclude-remainder-jobs` | Keep the unselected jobs once, or drop them (default). |
+| `--parents P1 P2` | Advance numbered inputs only for these parents; others stay fixed (default: all). |
+| `--parents none` | Advance nothing: `-n 5 --parents none` is plain replication. |
+| `--set [JOB:]PARAM=VALUE` | Set a parameter. Value is JSON if it parses, else text. Ranges and lists sweep (below). |
+| `--combine product\|zip` | Several sweeps: every combination (default) or in lockstep. |
+| `--job-sep`, `--range-sep`, `--list-sep` | Change the `:`, `:` and `,` used in `--set`. |
+| `--max-jobs N` | Refuse to write more than N jobs (default 1000). |
+| `-o, --output FILE` | Output path (default below). |
+| `--no-id-update`, `--no-date-update`, `--no-title-update` | Keep the source `_id`, `createdAt` or title. |
 
-Without `--repeats`, the input JSON (or bundled example) is written unchanged,
-except for any requested `--set` overrides. This makes it easy to export a
-starter template and edit it manually. Input files are never overwritten.
+### Sweeping parameters
 
-Parameter values are parsed as JSON when possible: `--set class3D_N_K=5`,
-`--set class3D_target_res=12.5`, `--set some_flag=true`, or
-`--set some_text='"hello"'`. If the text is not valid JSON, it is stored as a
-plain string. Unknown parameter names produce an error rather than silently
-creating a nonstandard CryoSPARC parameter.
+Each range or list in `--set` is an **axis**; the repeated jobs are copied once per combination of axis values.
 
-## How repetitions and connections work
-
-The bundled template has one `class_3D` job, whose particle input is
-`P1.particles` and whose mask inputs are `P2.imported_mask_1` and
-`P3.imported_mask_1`. Its parent declarations contain `imported_mask_1`.
-
-With `-n 12`, the script creates jobs `J1`–`J12` in **ascending** index order:
-
-| Job | Particle input | Mask input | Focus mask input |
-| --- | --- | --- | --- |
-| J1 | P1.particles | P2.imported_mask_1 | P3.imported_mask_1 |
-| J2 | P1.particles | P2.imported_mask_2 | P3.imported_mask_2 |
-| ... | ... | ... | ... |
-| J12 | P1.particles | P2.imported_mask_12 | P3.imported_mask_12 |
-
-The parent `connections` lists for P2 and P3 are rebuilt in ascending
-numerical order (`imported_mask_1`, `imported_mask_2`, ..., `imported_mask_12`).
-Unindexed inputs such as `P1.particles` remain untouched.
-
-For a workflow containing two otherwise identical `class_3D` jobs using mask
-indices 1 and 2, the default `-n 5` **extends the series to 5 total jobs**
-(indices 1 through 5). This is intentionally different from the original
-behavior, which can be requested explicitly with `--no-series-extension`:
+| Value | Meaning |
+| --- | --- |
+| `K=5` | One value (not a sweep). |
+| `K=2:10:2` | `start:stop:step` = 2, 4, 6, 8, 10 (**stop inclusive**). |
+| `K=2:10` | Step defaults to 1 (or -1 if stop < start). |
+| `res=0.1:0.5:0.1` | Float steps are exact. |
+| `K=2,4,8` | Curated list; items may be ranges (`2:4,8,10:20:5`). |
+| `J2:K=2:4` | Sweep only source job `J2`. |
 
 ```bash
-# Two equivalent jobs -> five final classification jobs
-python cryosparc_workflow_repeat.py two_jobs.json -n 5
-
-# Two equivalent jobs -> ten final classification jobs
-python cryosparc_workflow_repeat.py two_jobs.json -n 5 --no-series-extension
-
-# Select a two-job series; other jobs are excluded by default
-python cryosparc_workflow_repeat.py full_workflow.json -n 5 --jobs J2 J3
-
-# Select a two-job series; retain all other input jobs once
-python cryosparc_workflow_repeat.py full_workflow.json -n 5 \
-  --jobs J2 J3 --include-remainder-jobs
-
-# Only advance numbered inputs from P2; leave P3 inputs fixed
-python cryosparc_workflow_repeat.py full_workflow.json -n 5 \
-  --jobs J2 J3 --parents P1 P2
+python cryosparc_workflow_repeat.py my.json -n 12 --set K=2:10:2     # 12 masks x 5 values = 60 jobs
+python cryosparc_workflow_repeat.py my.json --set K=2:10:2           # 5 jobs, masks untouched
+python cryosparc_workflow_repeat.py my.json -n 5 --parents none --set res=8,10,12   # 5 identical repeats x 3
+python cryosparc_workflow_repeat.py my.json --set K=2:10:2 --set res=8,10,12 --combine zip   # needs equal lengths
 ```
 
-A **simple series** is detected only when at least two selected jobs have
-identical job definitions except for numbered parent-output indices, and
-the **varying** numbered inputs agree on the order of the jobs. Numbered
-inputs that are **constant** across the selected source jobs are pinned
-and stay unchanged. For example, `particles_class_0/1` and
-`volume_class_0/1` advance together while every job retains the same
-`imported_mask_1` solvent mask. **Input job order does not
-matter:** if `J1` uses `imported_mask_1` and `J2` uses `imported_mask_0`,
-`-n 5` still produces `J1` through `J5` connected to masks `_0` through
-`_4`, in ascending order. Likewise, a reversed `_2`, `_1` series generates
-`_1` through `_5`. A zero-based input series (containing index `_0`) stays
-zero-based, so `-n 5` generates `_0` through `_4`. Other inputs are normalized to `_1`
-through `_5`. If this is not true (for example, job parameters differ or jobs depend on each
-other), the script conservatively falls back to block repetition.
+- `-n` and sweeps are independent: `-n` advances numbered connections (masks 1..N), sweeps multiply on top. The first swept `--set` varies slowest, the `-n` position fastest. `-n 1` renumbers connections to start at the first index; omit `-n` to leave them alone.
+- `JOB:` is a job ID **in the source workflow**. In an extended series any member's ID selects the whole series. Targeted values are applied after untargeted ones.
+- Only the jobs a sweep changes, plus everything downstream of them, are copied. Other jobs are left out (a note says which) unless `--include-remainder-jobs`, which keeps them once after the copies. A copied job that uses a left-out job is an error. So with two jobs, `--set J2:K=2:8:1` gives 7 jobs, or 8 with `--include-remainder-jobs`. Kept jobs take scalar values only.
+- A value is a range only if every piece is a number, so `C:/data` stays text. Quote numeric-looking text as JSON (`'"12:30:00"'`). JSON lists (`[1,2]`) are single list-valued parameters, not sweeps.
 
-**Slots advance from their own start index.** Each advancing numbered input
-slot counts up from its own first index: `0` if the slot uses
-index 0 anywhere in the series, otherwise `1`. A series of
-`particles_class_0/1` with `imported_mask_1/2` therefore becomes classes `_0`..
-with masks `_1`.. rather than being rejected or strided. Slots only need to
-agree on the job *order*, not on the numbers.
+### How repetition works
 
-**Selecting a single job of a series.** Pinning is judged from the *selected*
-jobs. With two or more selected series jobs, an input that is the same in all
-of them (for example one shared mask) is pinned. With a single job, e.g.
-`--jobs J2`, there is nothing to compare, so every numbered input of the
-selected parents advances, including that mask. The job's position and start
-index in the series still come from all identical jobs in the workflow, so the
-class series of `--jobs J2` matches the full run (including a zero-based series
-staying zero-based). A lone job with no identical sibling advances each numbered
-input from its own start index. Use `--parents` to name only the parents that
-should advance and pin the rest (`--parents P1` keeps a P2 mask fixed either way).
+- **Series.** If at least two selected jobs are identical except for numbered parent-output indices (like `imported_mask_1`, `imported_mask_2`) and agree on order, `-n 5` extends the series to 5 jobs. Input order doesn't matter, a zero-based series stays zero-based, and inputs that are the same in every job (one shared mask) stay pinned. Otherwise it falls back to block repetition.
+- **Block repetition.** Each selected job is copied N times; references between selected jobs follow each copy, external inputs are kept.
+- **Indices.** Each numbered input counts up from its own start index (0 if it uses `_0`, else 1). Names need a trailing `_<number>` and the parent must declare at least one such name.
+- **Single job.** `--jobs J2` advances every numbered input of the selected parents; use `--parents` to pin the rest.
+- **Parents.** `--parents` chooses which outputs are reindexed, not which jobs are selected. Parent `connections` are rebuilt from the generated jobs.
+- **Excluded jobs.** With `--jobs`, other jobs are dropped unless `--include-remainder-jobs`; check dependencies if you drop a job others use.
 
-For more general inputs:
+The tool edits workflow JSON only; it doesn't check that the parent outputs exist in a project, so inspect the result before importing it into CryoSPARC.
 
-- Outside series mode, each selected job is repeated N times (N **copies per job**).
-  With `--no-series-extension`, a recognized series still advances its
-  varying inputs from their own start indices (one series position per copy);
-  shared numbered inputs remain fixed.
-- With `--jobs`, other jobs are **excluded by default**. Use
-  `--include-remainder-jobs` to retain them once, with internal job-ID
-  references adjusted where possible. Check dependent job connections if you
-  exclude jobs that other jobs depend on.
-- Indexed parent output names must have a trailing underscore-number suffix,
-  such as `imported_mask_7`. The parent declaration must contain at least one
-  corresponding numbered name so the script can recognize that output family.
-- If the starting jobs use K distinct indexed positions, each repetition uses
-  the next K positions. Source positions are normalized to 0..K-1 if any
-  selected source index is `_0`, otherwise to 1..K. For example, a workflow
-  with inputs `_3`, `_2`, `_1` expands into 3N jobs using 1..3N; inputs
-  `_0`, `_1` expand to 0..2N-1.
-- Jobs are ordered by their original indexed input position (ascending) within
-  each copy. Multiple independent jobs at the same index share that index.
-- References from a job to another job **within** the input block are remapped
-  to that copy's new job IDs. External parent inputs are preserved.
-- Each parent output family is rebuilt from the generated job references.
-  Unindexed parent connections are retained.
-- `--parents` filters **which parent outputs are reindexed**, not which jobs
-  are selected. For example, `--parents P1 P2` advances the numbered outputs
-  of P2 while keeping all P3 connections unchanged. In series-extension mode,
-  unselected parents use the connection from the **lowest-index job**,
-  regardless of its position in the input JSON. Different numeric suffixes
-  on unselected parents do not prevent detection of a series. In block mode,
-  unselected parents keep each source job's original
-  connections. Parent `connections` declarations are rebuilt to match the
-  resulting jobs. A parent with no numbered outputs (such as P1.particles)
-  may be included alongside another parent, but selecting only parents with
-  no numbered outputs is an error.
+### Output names and metadata
 
+Default output is `workflow.json` (no input), `<input-stem>.json`, or with `-n` `<input-stem>_repeated_<N>.json` (`workflow_repeated_<N>.json` for the template), with `--set` text appended (unsafe characters become `_`). With `-n` or a sweep a fresh `_id`, `createdAt` and `title` are generated.
 
-The script changes workflow JSON only; it does not inspect `.mrc` files or
-verify the named parent outputs exist in a CryoSPARC project. The destination
-workflow must have compatible parent jobs/outputs. Inspect the exported JSON
-before importing it into CryoSPARC.
+## cryosparc_cs_count.py
+
+Prints the number of particles in each `.cs` file as `count<TAB>file`. Only the NumPy header is read, so it is instant on huge files.
+
+```bash
+python cryosparc_cs_count.py J42/*.cs
+python cryosparc_cs_count.py particles_*.cs --output-csv counts.csv    # columns: file,particles
+```
+
+Wildcards are expanded by the tool (so they work on Windows too). Unreadable files and patterns that match nothing are reported on stderr, the rest are still counted, and the exit code is 1. NumPy-format `.cs` files only. An existing CSV is overwritten.
+
+## cryosparc_csg_grep.py
+
+Prints values from `.csg` or any YAML file. Every value has a path such as `results.blob.num_items`; list items use their index (`items.0.name`).
+
+```bash
+python cryosparc_csg_grep.py J267_class_0.csg -k results.blob.num_items
+python cryosparc_csg_grep.py *.csg -k results.blob.num_items -k group.name --output-csv summary.csv
+python cryosparc_csg_grep.py *.csg -k 'results.*.num_items' --long --output-csv long.csv
+python cryosparc_csg_grep.py a.csg                                  # no -k: every value
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-k, -e, --key PATTERN` | Path to extract; repeat for several. Results follow the order given. |
+| (default matching) | Shell-style: `*`/`?` stay within one level, `**` crosses levels, `[abc]` sets. |
+| `--regex` | Pattern is a regular expression searched in the full path. |
+| `--fixed` | Pattern is an exact path, no wildcards. |
+| `-i, --ignore-case` | Case-insensitive keys. |
+| `--sep STR` | Level separator in paths (default `.`); use it if your keys contain dots. |
+| `--values-only` | Print just values, one per line. |
+| `--output-csv FILE` | Also write a CSV: `file` plus one column per matched path (blank where a file lacks it). |
+| `--long` | With `--output-csv`: columns `file,key,value`, one row per match. |
+
+Output lines are `key<TAB>value`, prefixed with the file name when there are several files. A section (dict or list) is printed as compact JSON only when nothing inside it matched. Timestamps are kept as written. A pattern with no match in a file prints a warning and gives exit code 1; unreadable files are reported and skipped. Only keys are matched, not values.
 
 ## Tests
 
-Tests use temporary directories for generated workflow files. The `-B`
-flag prevents Python from creating `__pycache__` in the repository.
-
 ```bash
-python -B -m unittest discover -s tests -v
+python run_tests.py              # all tools, with a per-tool summary (exit code 1 on failure)
+python run_tests.py cs_count -v  # one tool, verbose
+cryosparc-io-tools-test          # same, when installed (use `uv run` or the venv)
 ```
 
-## Repository layout
+Tests live in `tests/` (`test_workflow_repeat.py`, `test_cs_count.py`, `test_csg_grep.py`) and use temporary directories.
+
+## Layout
 
 ```text
-cryosparc-io-tools/
-  cryosparc_workflow_repeat.py         # convenient direct-run wrapper
-  pyproject.toml
-  README.md
-  src/cryosparc_io_tools/
-    __init__.py
-    cryosparc_workflow_repeat.py       # implementation and console entry point
-    templates/class_3d_template.json  # bundled example workflow
-  tests/test_workflow_repeat.py
+cryosparc_workflow_repeat.py  cryosparc_cs_count.py  cryosparc_csg_grep.py  run_tests.py   # run-from-checkout wrappers
+src/cryosparc_io_tools/       # implementations, _common.py (wildcards, CSV), run_tests.py, templates/
+tests/
 ```
-
-## Output names and metadata
-
-Without an input or repeat count, `python cryosparc_workflow_repeat.py` writes
-`workflow.json` in the current working directory. With an input file but no
-repeat count, it writes `<input-stem>.json` in the current working directory
-(and refuses to overwrite the original input file). With repetitions, the
-default output is `<input-stem>_repeated_<N>.json` or
-`workflow_repeated_<N>.json` when using the bundled template (with `_PARAM_VALUE` suffixes for any `--set` options). Use `-o` to
-choose another name.
-
-When `-n` is supplied, new workflow metadata is generated by default:
-`_id` becomes a fresh 24-character hexadecimal identifier, `createdAt`
-becomes the current UTC timestamp, and `title` describes the job type(s),
-requested repeat count and any `--set` overrides. Disable each independently
-with `--no-id-update`, `--no-date-update`, and `--no-title-update`.
-Without `-n`, metadata is preserved to make the exported template easy to edit.
-
-The bundled template has category `Workflow Repeat` and explains the required
-particle, solvent-mask and focus-mask parent inputs in its description.
-
-### Default filenames with parameter overrides
-
-For example, `-n 12 --set class3D_N_K=5` creates `workflow_repeated_12_class3D_N_K_5.json` when using the bundled template. Multiple `--set` values are appended in the order supplied; filename-unsafe characters are replaced with underscores. An explicit `-o` always takes precedence.
